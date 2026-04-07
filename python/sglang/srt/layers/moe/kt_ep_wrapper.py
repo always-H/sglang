@@ -63,7 +63,6 @@ class KTConfig:
         gpu_experts_mask: Boolean tensor of shape [num_experts] indicating which experts are on GPU
         cpuinfer_threads: Number of CPU inference threads
         threadpool_count: Number of thread pools for CPU computation
-        numa_nodes: Optional explicit NUMA node ids for each KT threadpool
         weight_path: Path to CPU quantized weights
         chunked_prefill_size: Chunk size for prefill computation
         method: CPU computation method (e.g., "int4")
@@ -80,7 +79,6 @@ class KTConfig:
     chunked_prefill_size: int
     max_deferred_experts_per_token: int
     method: str
-    numa_nodes: Optional[List[int]] = None
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
@@ -89,6 +87,235 @@ class KTConfig:
 _SHARED_FULL_CONTEXT = None
 _SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
 
+# TODO: 改成全局类
+
+_GLOBAL_STAGE_CPU_BUFFER = None
+def get_global_stage_cpu_buffer():
+    global _GLOBAL_STAGE_CPU_BUFFER
+    if _GLOBAL_STAGE_CPU_BUFFER is None:
+        _GLOBAL_STAGE_CPU_BUFFER = GlobalBuffer()
+    return _GLOBAL_STAGE_CPU_BUFFER
+
+class GlobalBuffer:
+    def __init__(self):
+        self.w13_weight_ondemand = None
+        self.w2_weight_ondemand = None
+        self.w13_weight_extra = None
+        self.w2_weight_extra = None
+        
+        self.hot_expert_ids_cpu_od = None
+        self.cold_expert_ids_cpu_od = None
+        self.dst_slot_cpu_od = None
+        self.extra_expert_ids_cpu_od = None
+
+        self.hot_expert_ids_cpu_pre = None
+        self.cold_expert_ids_cpu_pre = None
+        self.dst_slot_cpu_pre = None
+
+        self.num_gpu_experts = None
+        self.hidden_size = None
+        self.moe_intermedia_size = None
+        self.initialized = False
+        
+        self.ondemand_d2d_stream = None
+        self.extra_comp_stream = None
+        self.d2h_stream = None
+        self.d2h_events = None
+        self.extra_events = None
+        self.extra_event_id = 0
+        
+        self.stage2_gpu_mask_cuda = None
+        self.stage2_logic_to_gpu_index_cuda = None
+        self.stage2_extra_gpu_logic_index_cuda = None
+        self.selected_mask_cuda = None
+        self.single_expert_topk_ids_buf = None
+
+    def create_buffer(self, num_gpu_experts, hidden_size, moe_intermedia_size, global_expert_num, device="cuda"):
+        # 已经初始化过且尺寸一致，直接返回
+        if self.initialized:
+            if (
+                self.num_gpu_experts == num_gpu_experts
+                and self.hidden_size == hidden_size
+                and self.moe_intermedia_size == moe_intermedia_size
+            ):
+                return self
+
+            self.reset()
+
+        self.w13_weight_ondemand = torch.empty(
+            (num_gpu_experts, 2 * moe_intermedia_size, hidden_size),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.w2_weight_ondemand = torch.empty(
+            (num_gpu_experts, hidden_size, moe_intermedia_size),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.w13_weight_extra = torch.empty(
+            (num_gpu_experts, 2 * moe_intermedia_size, hidden_size),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.w2_weight_extra = torch.empty(
+            (num_gpu_experts, hidden_size, moe_intermedia_size),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        self.hot_expert_ids_cpu_od = torch.empty(
+            (num_gpu_experts,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        self.cold_expert_ids_cpu_od = torch.empty(
+            (num_gpu_experts,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        self.dst_slot_cpu_od = torch.empty(
+            (num_gpu_experts,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        self.extra_expert_ids_cpu_od = torch.empty(
+            (global_expert_num,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+
+        self.hot_expert_ids_cpu_pre = torch.empty(
+            (num_gpu_experts,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        self.cold_expert_ids_cpu_pre = torch.empty(
+            (num_gpu_experts,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        self.dst_slot_cpu_pre = torch.empty(
+            (num_gpu_experts,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+
+        self.global_expert_num = global_expert_num
+        self.num_gpu_experts = num_gpu_experts
+        self.hidden_size = hidden_size
+        self.moe_intermedia_size = moe_intermedia_size
+        self.d2h_stream = torch.cuda.Stream(device=device)
+        self.d2h_events = [torch.cuda.Event() for _ in range(num_gpu_experts)]
+        self.extra_events = [torch.cuda.Event() for _ in range(int(global_expert_num / num_gpu_experts) + 1)]
+        self.ondemand_d2d_stream = torch.cuda.Stream(device=device)
+        self.extra_comp_stream = torch.cuda.Stream(device=device)
+
+
+        self.initialized = True
+        self.stage2_gpu_mask_cuda = torch.full(
+            (global_expert_num,), False, dtype=torch.bool, device=device
+        )
+        self.stage2_logic_to_gpu_index_cuda = torch.full(
+            (global_expert_num,), -1, dtype=torch.int, device=device
+        )
+        self.stage2_extra_gpu_logic_index_cuda = torch.arange(
+            (num_gpu_experts), dtype=torch.int, device=device
+        )
+        self.selected_mask_cuda = torch.full(
+            (global_expert_num,), False, dtype=torch.bool, device=device
+        )
+        
+        return self
+
+    def reset(self): 
+        self.w13_weight_ondemand = None
+        self.w2_weight_ondemand = None
+
+        self.hot_expert_ids_cpu_od = None
+        self.cold_expert_ids_cpu_od = None
+        self.dst_slot_cpu_od = None
+
+        self.hot_expert_ids_cpu_pre = None
+        self.cold_expert_ids_cpu_pre = None
+        self.dst_slot_cpu_pre = None
+
+        self.d2h_stream = None
+        self.d2h_events = None
+        self.num_gpu_experts = None
+        self.hidden_size = None
+        self.moe_intermedia_size = None
+        self.initialized = False
+        torch.cuda.empty_cache()
+
+    def stage2_reset(self):
+        self.stage2_gpu_mask_cuda.fill_(False)      # 将所有元素设为 False
+        self.stage2_logic_to_gpu_index_cuda.fill_(-1)  # 将所有元素设为 -1
+        self.reset_select_mask_cuda()
+    
+    def reset_select_mask_cuda(self):
+        self.selected_mask_cuda.fill_(False)
+
+    def create_topk_ids_buf(self, topk_ids):
+        if self.topk_initialized:
+            return self
+        self.single_expert_topk_ids_buf = torch.empty_like(topk_ids)
+
+    def get_pcie_transferred_num(self):
+        cpu_comp_time = 15     # 20ms for 1024
+        expert_pcie_time = 2.1 # 2.1ms for transferring one expert's weights from CPU 2 GPU
+        return int(cpu_comp_time / expert_pcie_time)
+
+    def scheduler(self, selected_experts, expert_counts, layer: "KTEPWrapperMethod"):
+        selected_mask = self.selected_mask_cuda
+
+        # 1) 过滤掉 0-count 的补位专家
+        target_experts = selected_experts[expert_counts[selected_experts] > 0]
+
+        if target_experts.numel() == 0:
+            empty = selected_experts.new_empty((0,))
+            return empty, empty, empty
+
+        # 2) 需要 ondemand 换入的专家
+        hot_expert = target_experts[
+            layer.logical_to_gpu_index_cuda[target_experts] < 0
+        ]
+
+        if hot_expert.numel() == 0:
+            empty = selected_experts.new_empty((0,))
+            return empty, empty, empty
+
+        # 3) 标记目标集合
+        selected_mask[target_experts] = True
+
+        # 4) 当前 resident experts 中，不在目标集合里的就是 cold candidate
+        resident_expert = layer.gpu_index_to_logical_cuda
+        cold_mask = ~selected_mask[resident_expert]
+        cold_expert = resident_expert[cold_mask]
+
+        if hot_expert.numel() > cold_expert.numel():
+            selected_mask.zero_()
+            raise RuntimeError(
+                f"scheduler error: need {hot_expert.numel()} cold experts, "
+                f"but only {cold_expert.numel()} are evictable."
+            )
+
+        # 5) 优先替换本轮工作量最小的 cold expert
+        cold_counts = expert_counts[cold_expert]
+        cold_order = torch.argsort(cold_counts, descending=False)[:hot_expert.numel()]
+        cold_expert = cold_expert[cold_order]
+
+        # 6) 取对应 slot
+        cold_gpu_slot = layer.logical_to_gpu_index_cuda[cold_expert]
+
+        selected_mask.zero_()
+        return hot_expert, cold_expert, cold_gpu_slot
 
 class SharedStagingBuffer:
     """Global shared staging buffer for CPU expert input across all MoE layers.
@@ -197,6 +424,11 @@ class SharedFullContext:
             )
         self.gpu_layer.quant_method = self.gpu_method
 
+        # Detect quantization type for weight loading
+        self.is_fp8_quant = self._detect_fp8_quant()
+        self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
+        self.is_bf16_quant = self._detect_bf16_quant()
+
         self.gpu_method.create_weights(
             layer=self.gpu_layer,
             num_experts=global_num_experts,
@@ -204,11 +436,6 @@ class SharedFullContext:
             intermediate_size_per_partition=intermediate_size_per_partition,
             params_dtype=params_dtype,
         )
-
-        # Detect quantization type for weight loading based on actually created weights.
-        # This is more robust than class-based detection when quant methods are wrapped
-        # (e.g., KT wrapper -> compressed-tensors scheme), especially in layerwise prefill.
-        self._detect_quant_type_from_created_weights()
 
         # Move all parameters to target device
         for param in self.gpu_layer.parameters():
@@ -229,70 +456,6 @@ class SharedFullContext:
         self.gpu_layer.moe_runner_config = runner_config
         self.gpu_method.create_moe_runner(self.gpu_layer, runner_config)
 
-    def _get_base_quant_method(self):
-        """Unwrap nested quant methods to get the underlying base method.
-
-        Some paths may wrap the real quant method with KT wrappers/schemes.
-        """
-        method = self.gpu_method
-        visited = set()
-
-        while method is not None and id(method) not in visited:
-            visited.add(id(method))
-
-            # KT wrapper pattern: method.gpu_method
-            nested = getattr(method, "gpu_method", None)
-            if nested is not None and nested is not method:
-                method = nested
-                continue
-
-            # Compressed-tensors scheme pattern: method.scheme
-            nested = getattr(method, "scheme", None)
-            if nested is not None and nested is not method:
-                method = nested
-                continue
-
-            break
-
-        return method
-
-    def _detect_quant_type_from_created_weights(self) -> None:
-        """Detect quant type from weight attributes created on gpu_layer."""
-        layer = self.gpu_layer
-
-        # INT4 Marlin
-        if hasattr(layer, "w13_weight_packed") and hasattr(layer, "w2_weight_packed"):
-            self.is_fp8_quant = False
-            self.is_fp8_channel_quant = False
-            self.is_bf16_quant = False
-            return
-
-        # FP8 block
-        if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
-            self.is_fp8_quant = True
-            self.is_fp8_channel_quant = False
-            self.is_bf16_quant = False
-            return
-
-        # FP8 per-channel
-        if hasattr(layer, "w13_weight_scale") and hasattr(layer, "w2_weight_scale"):
-            self.is_fp8_quant = False
-            self.is_fp8_channel_quant = True
-            self.is_bf16_quant = False
-            return
-
-        # BF16 / unquantized
-        if hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight"):
-            self.is_fp8_quant = False
-            self.is_fp8_channel_quant = False
-            self.is_bf16_quant = True
-            return
-
-        # Fallback to class-based detection for unknown layouts.
-        self.is_fp8_quant = self._detect_fp8_quant()
-        self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
-        self.is_bf16_quant = self._detect_bf16_quant()
-
     def _detect_fp8_quant(self) -> bool:
         """Detect if the quantization method is FP8 block quant.
 
@@ -301,7 +464,7 @@ class SharedFullContext:
         """
         from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 
-        method = self._get_base_quant_method()
+        method = self.gpu_method
         # Check for Fp8MoEMethod with block_quant
         if isinstance(method, Fp8MoEMethod) and getattr(method, "block_quant", False):
             return True
@@ -328,7 +491,7 @@ class SharedFullContext:
         except ImportError:
             return False
 
-        method = self._get_base_quant_method()
+        method = self.gpu_method
         method_name = method.__class__.__name__
 
         # Check for CompressedTensorsW8A8Fp8MoEMethod with channel strategy
@@ -350,53 +513,12 @@ class SharedFullContext:
             UnquantizedFusedMoEMethod,
         )
 
-        method = self._get_base_quant_method()
+        method = self.gpu_method
         # Check for UnquantizedFusedMoEMethod
         if isinstance(method, UnquantizedFusedMoEMethod):
             return True
 
         return False
-
-    def _resolve_int4_quant_params(self):
-        """Resolve INT4 quant params from potentially wrapped quant methods.
-
-        Some quantization paths (e.g., compressed-tensors) expose INT4 metadata on
-        the underlying scheme instead of the outer fused method wrapper.
-        """
-        candidates = []
-        seen = set()
-
-        def add_candidate(obj):
-            if obj is None:
-                return
-            obj_id = id(obj)
-            if obj_id in seen:
-                return
-            seen.add(obj_id)
-            candidates.append(obj)
-
-        base_method = self._get_base_quant_method()
-        add_candidate(self.gpu_method)
-        add_candidate(getattr(self.gpu_method, "gpu_method", None))
-        add_candidate(getattr(self.gpu_method, "scheme", None))
-        add_candidate(base_method)
-        add_candidate(getattr(base_method, "scheme", None))
-        add_candidate(getattr(self.gpu_layer, "scheme", None))
-
-        required = ("num_bits", "packed_factor", "group_size")
-        for candidate in candidates:
-            if all(hasattr(candidate, attr) for attr in required):
-                return (
-                    getattr(candidate, "num_bits"),
-                    getattr(candidate, "packed_factor"),
-                    getattr(candidate, "group_size"),
-                    getattr(candidate, "actorder", None),
-                )
-
-        raise AttributeError(
-            "Unable to resolve INT4 quantization params: expected attributes "
-            "num_bits/packed_factor/group_size on quant method or scheme"
-        )
 
     @property
     def weight_names(self) -> list:
@@ -558,9 +680,12 @@ class SharedFullContext:
         os.sched_setaffinity(0, {target_cpu})
 
         layer = self.gpu_layer
-        num_bits, packed_factor, group_size, actorder = (
-            self._resolve_int4_quant_params()
-        )
+        method = self.gpu_method
+
+        num_bits = method.num_bits
+        packed_factor = method.packed_factor
+        group_size = method.group_size
+        actorder = getattr(method, "actorder", None)
         num_experts = layer.num_experts
         device = layer.w13_weight_packed.device
 
@@ -699,11 +824,6 @@ class SharedFullContext:
             if do_write:
                 wrapper.sync_write_weight_scale_to_buffer()
                 if e + 1 < num_experts:
-                    # Before writing to slot (e+1)%2, make sure the previous
-                    # copy from that slot has completed to avoid overwriting
-                    # pinned host memory while DMA is in-flight.
-                    if e > 0:
-                        events[e - 1].synchronize()
                     submit_write_expert(e + 1)
 
             # Barrier to ensure all ranks see the written data
@@ -1419,13 +1539,8 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     if _KT_GPU_EXPERTS_MASKS is not None:
         return _KT_GPU_EXPERTS_MASKS
 
-    # Get model config (unwrap VL configs that nest the text model config)
+    # Get model config
     hf_config = server_args.get_hf_config()
-
-    # fix for kimi-k2.5 models where text_config holds the actual config
-    if getattr(hf_config, "text_config", None) is not None:
-        hf_config = hf_config.text_config
-
     num_layers = getattr(hf_config, "num_hidden_layers", None)
     # Try different attribute names for num_experts
     num_experts = getattr(hf_config, "num_local_experts", None)
@@ -1443,14 +1558,6 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     # Get first_k_dense_replace to identify which layers are MoE layers
     first_k_dense_replace = getattr(hf_config, "first_k_dense_replace", 0)
     moe_layer_freq = getattr(hf_config, "moe_layer_freq", 1)
-
-    # Normalize list-form moe_layer_freq (e.g., MiMo-V2-Flash: [0, 1, 1, ...])
-    # to standard (first_k_dense_replace, moe_layer_freq=1) form
-    if isinstance(moe_layer_freq, list):
-        # Find first MoE layer index from the mask
-        first_moe = next((i for i, v in enumerate(moe_layer_freq) if v), 0)
-        first_k_dense_replace = max(first_k_dense_replace or 0, first_moe)
-        moe_layer_freq = 1
 
     # Count actual MoE layers
     num_moe_layers = sum(
@@ -1638,14 +1745,8 @@ def create_kt_config_from_server_args(
         layer_idx: Layer index in the model
 
     Returns:
-        KTConfig if KT is configured and not disabled, None otherwise
+        KTConfig if KT is configured, None otherwise
     """
-    # Check if KT EP wrapper is disabled (e.g., for draft models in speculative decoding)
-    from sglang.srt.layers.moe.utils import is_kt_ep_wrapper_disabled
-
-    if is_kt_ep_wrapper_disabled():
-        return None
-
     if server_args.kt_weight_path is None:
         return None
 
@@ -1657,10 +1758,8 @@ def create_kt_config_from_server_args(
     # Get mask for this specific layer
     gpu_experts_mask = masks[layer_idx]
 
-    # Get num_layers from model config (unwrap VL configs)
+    # Get num_layers from model config
     hf_config = server_args.get_hf_config()
-    if hasattr(hf_config, "text_config"):
-        hf_config = hf_config.text_config
     num_layers = getattr(hf_config, "num_hidden_layers", None)
 
     return KTConfig(
@@ -1668,7 +1767,6 @@ def create_kt_config_from_server_args(
         gpu_experts_mask=gpu_experts_mask,
         cpuinfer_threads=server_args.kt_cpuinfer,
         threadpool_count=server_args.kt_threadpool_count,
-        numa_nodes=server_args.kt_numa_nodes,
         weight_path=server_args.kt_weight_path,
         chunked_prefill_size=server_args.chunked_prefill_size,
         method=server_args.kt_method,
@@ -1751,6 +1849,34 @@ def select_top_experts_from_batch(
 
     return selected_experts
 
+def select_top_experts_from_batch_by_hot(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    num_gpu_experts: int,
+):
+    flat_ids = topk_ids.flatten()
+    valid_mask = (flat_ids >= 0) & (flat_ids < num_experts)
+
+    safe_ids = torch.where(valid_mask, flat_ids, torch.zeros_like(flat_ids))
+    contrib = valid_mask.to(torch.int64)
+
+    expert_counts = torch.zeros(num_experts, dtype=torch.int64, device=topk_ids.device)
+    expert_counts.scatter_add_(0, safe_ids, contrib)
+
+    _, selected_indices = torch.topk(   
+        expert_counts,
+        k=min(num_gpu_experts, num_experts),
+        largest=True,
+        sorted=True,
+    )
+    return selected_indices, expert_counts
+
+def find_hot_expert(topk_ids):
+    flat_ids = topk_ids.view(-1)
+    unique_values, counts = torch.unique(flat_ids, return_counts=True)
+    sorted_counts, sorted_indices = torch.sort(counts, descending=True)
+    sorted_unique_values = unique_values[sorted_indices]
+    return sorted_counts, sorted_unique_values
 
 def copy_experts_weights_int4(
     src_layer: torch.nn.Module,
@@ -1995,22 +2121,26 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
-        self.tp_rank = get_tensor_model_parallel_rank()
+        try:
+            self.tp_rank = get_tensor_model_parallel_rank()
+        except AssertionError:
+            self.tp_rank = 0
 
         # Mapping tables for non-contiguous GPU expert allocation (CPU tensors)
         # Used by weight_loader to remap expert_id when loading weights
         gpu_expert_indices = torch.where(self.gpu_experts_mask)[0]
         self.logical_to_gpu_index = torch.full(
-            (len(self.gpu_experts_mask),), -1, dtype=torch.int32
+            (len(self.gpu_experts_mask),), -1, dtype=torch.int32, device="cpu"
         )
         self.logical_to_gpu_index[gpu_expert_indices] = torch.arange(
-            len(gpu_expert_indices), dtype=torch.int32
+            len(gpu_expert_indices), dtype=torch.int32, device="cpu"
         )
         self.gpu_index_to_logical = gpu_expert_indices.to(torch.int32)
 
         # CUDA tensors for inference (will be set in create_weights)
         self.gpu_experts_mask_cuda = None
         self.logical_to_gpu_index_cuda = None
+        self.gpu_index_to_logical_cuda = None
 
         self.gpu_prefill_token_threshold = kt_config.gpu_prefill_token_threshold or 0
         self._full_init_args = None
@@ -2024,6 +2154,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Shared staging buffer reference (initialized in create_weights, shared across all layers)
         self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
         self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
+
+        self.global_buffer = get_global_stage_cpu_buffer()
+        self.ondemand_d2d_stream = None
+
+        self.pending_hot_expert: Optional[int] = None
+        self.pending_gpu_slot: Optional[int] = None
+        self.pending_victim_expert: Optional[int] = None
+        self.pending_expert_ready: bool = False
 
     def create_weights(
         self,
@@ -2053,11 +2191,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Get required parameters from layer object
         # top_k: number of experts selected per token
-        num_experts_per_tok = layer.top_k
-
+        try:
+            num_experts_per_tok = layer.top_k
+        except AttributeError:
+            num_experts_per_tok = 6
         # intermediate_size_full: full intermediate size before TP partitioning
         intermediate_size_full = (
-            layer.intermediate_size_per_partition * layer.moe_tp_size
+            intermediate_size_per_partition * 1
         )
 
         layer_max_deferred = self.kt_config.max_deferred_experts_per_token or 0
@@ -2084,6 +2224,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         target_device = next(layer.parameters()).device
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
+        self.gpu_index_to_logical_cuda = self.gpu_index_to_logical.to(device=target_device) # 额外维护一个CUDA上面的Tensor
 
         # Initialize dual-stream for CPU-GPU parallelism (rank 0 only)
         if self.tp_rank == 0:
@@ -2110,11 +2251,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
-                numa_nodes=self.kt_config.numa_nodes,
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+            )
+            self.global_buffer.create_buffer(
+                self.num_gpu_experts,
+                hidden_size,
+                intermediate_size_full,
+                num_experts,
+                device=target_device,
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -2135,21 +2282,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             from sglang.srt.eplb.expert_location_dispatch import (
                 get_global_expert_location_metadata,
             )
-
-            metadata = get_global_expert_location_metadata()
-            if (
-                metadata is not None
-                and getattr(metadata, "physical_to_logical_map_cpu", None) is not None
-            ):
+            try:
                 physical_to_logical_map_cpu = (
-                    metadata.physical_to_logical_map_cpu[self.kt_config.layer_idx]
+                    get_global_expert_location_metadata()
+                    .physical_to_logical_map_cpu[self.kt_config.layer_idx]
                     .contiguous()
                 )
-            else:
-                # Fallback for setups without EPLB metadata: identity mapping.
-                physical_to_logical_map_cpu = torch.arange(
-                    layer.num_experts, dtype=torch.int64, device="cpu"
-                )
+            except AttributeError:
+                physical_to_logical_map_cpu = torch.arange(0, self.global_num_experts, dtype=torch.int32, device="cpu").contiguous()
             self.wrapper.load_weights(physical_to_logical_map_cpu)
 
     def create_moe_runner(
@@ -2282,6 +2422,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
+        topk_output_next_layer: "TopKOutput" = None,
+        next_layer: torch.nn.Module = None,
     ) -> "CombineInput":
         """Execute hybrid CPU+GPU MoE forward pass with parallelism.
 
@@ -2293,6 +2435,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Args:
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
+            e.g. 
+                StandardDispatchOutput(hidden_states=tensor([[-0.1777,  1.4219, -1.2344,  ...,  1.1953, -0.2793,  1.5000]],device='cuda:0', dtype=torch.bfloat16),
+                                        hidden_states_scale=None, 
+                                        topk_output=StandardTopKOutput(topk_weights=tensor([[0.0243, 0.0229, 0.0229, 0.0215, 0.0215, 0.0202, 0.0199, 0.0199]], device='cuda:0'), 
+                                        topk_ids=tensor([[54, 21, 30,  1, 10, 14, 18, 37]], device='cuda:0', dtype=torch.int32), 
+                                        router_logits=各个专家的得分
 
         Returns:
             Combined computation results from CPU and GPU experts
@@ -2302,6 +2450,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        # Step dynamic: Determine Expert IDs that need to be Transferred to GPU On-Demand and Expert IDs that need to be Transferred to Next Layer Prefetch
+        self.dynamic = False
+        if dispatch_output.hidden_states.size(0) > 1:
+            torch.cuda.current_stream().wait_stream(self.global_buffer.d2h_stream)
+            (
+                hot_expert,
+                cold_expert,
+                cold_gpu_slot,
+                next_layer_hot_expert,
+                next_layer_cold_expert,
+                next_layer_cold_gpu_slot,
+                extra_ondemand_expert,
+                extra_ondemand_expert_num,
+            ) = self.LayerScopeScheduler(dispatch_output, topk_output_next_layer, next_layer)
+            self.dynamic = True
+            self.ondemand_d2d_stream = self.global_buffer.ondemand_d2d_stream
+            
         # Record GPU expert mask for distribution tracking (rank 0 only)
         # Use gpu_experts_mask_cuda which is already on GPU for CUDA graph compatibility
         if self.tp_rank == 0:
@@ -2319,6 +2484,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
         ):
+            print("ALL TOKENS ON GPU")
             ctx = self._build_full_context(layer)
 
             t_compute = time.perf_counter()
@@ -2373,7 +2539,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # Submit uses staging_buffer, so GPU can modify original x freely
                 self._submit_with_staged_input(
                     layer, dispatch_output, staging_buffer
-                )
+                ) # CPU 1024 20ms
 
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
         # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
@@ -2381,6 +2547,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         masked_topk_ids = mask_and_remap_expert_ids(
             topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
         )
+
+        if self.dynamic:
+            buf = self.global_buffer
+            stage2_masked_topk_ids = mask_and_remap_expert_ids(
+                topk_ids, buf.stage2_gpu_mask_cuda, buf.stage2_logic_to_gpu_index_cuda
+            )
 
         # Create modified dispatch output for GPU computation
         masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
@@ -2392,8 +2564,47 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # No wait needed - staging buffer decouples CPU and GPU data access
         gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
 
+        # Step 3+: Execute On-Demand experts transferred from cpu
+        # after all GPU computation done
+        if self.dynamic:
+            # 计算完之后就可以更新GPU专家分布图了
+            with torch.cuda.stream(self.ondemand_d2d_stream):
+                transfer_num = self.transfer_num
+                self.gpu_experts_mask[self.global_buffer.hot_expert_ids_cpu_od[:transfer_num]] = True
+                self.gpu_experts_mask[self.global_buffer.cold_expert_ids_cpu_od[:transfer_num]] = False
+                self.gpu_experts_mask_cuda[hot_expert] = True 
+                self.gpu_experts_mask_cuda[cold_expert] = False
+
+                self.logical_to_gpu_index[self.global_buffer.hot_expert_ids_cpu_od[:transfer_num]] = self.global_buffer.dst_slot_cpu_od[:transfer_num]
+                self.logical_to_gpu_index[self.global_buffer.cold_expert_ids_cpu_od[:transfer_num]] = -1
+                self.logical_to_gpu_index_cuda[hot_expert] = cold_gpu_slot.to(torch.int32)
+                self.logical_to_gpu_index_cuda[cold_expert] = -1
+
+                self.gpu_index_to_logical[self.global_buffer.dst_slot_cpu_od[:transfer_num]] = self.global_buffer.hot_expert_ids_cpu_od [:transfer_num]
+                self.gpu_index_to_logical_cuda[cold_gpu_slot] = hot_expert.to(torch.int32)
+                for idx, dst_logic_id_gpu in enumerate(cold_gpu_slot):
+                    self.ondemand_d2d_stream.wait_event(self.d2h_events[idx])
+                    layer.w13_weight[dst_logic_id_gpu].copy_(self.global_buffer.w13_weight_ondemand[idx], non_blocking=True)
+                    layer.w2_weight[dst_logic_id_gpu].copy_(self.global_buffer.w2_weight_ondemand[idx], non_blocking=True)
+
+            # Create modified dispatch output for GPU computation
+            torch.cuda.current_stream().wait_stream(self.ondemand_d2d_stream)
+            if extra_ondemand_expert_num > 0:
+                for _ in range(int(extra_ondemand_expert_num / self.num_gpu_experts) + 1):
+                    transfer_num = self.extra_expert_submit(extra_ondemand_expert_num)
+                    gpu_combine_input.hidden_states += self.extra_expert_comp(transfer_num, topk_output, dispatch_output, layer)
+
+            masked_topk_output = topk_output._replace(topk_ids=stage2_masked_topk_ids)
+            masked_dispatch_output = dispatch_output._replace(
+                topk_output=masked_topk_output
+            )
+            stage2_gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            self.global_buffer.stage2_reset()
+
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
         output = gpu_combine_input.hidden_states
+        if self.dynamic:
+            output += stage2_gpu_combine_input.hidden_states
         if self.tp_rank == 0 and self._cpu_stream is not None:
             with torch.cuda.stream(self._cpu_stream):
                 # Use staging_buffer for sync to get correct buffer reference
@@ -2541,3 +2752,381 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logical_to_gpu_index=self.logical_to_gpu_index,
         )
         return _SHARED_FULL_CONTEXT
+
+    # Function For Expert Transfer
+    def submit_bf16_exp_H2D(self, hot_expert, cold_expert, cold_gpu_slot, next_layer=None):
+        transfer_num = hot_expert.numel()
+        self.copy_stream = self.global_buffer.d2h_stream
+        self.d2h_events = self.global_buffer.d2h_events
+        if next_layer is None and transfer_num > 0:
+            self.transfer_num = transfer_num
+        elif next_layer is not None and transfer_num > 0:
+            next_layer_kt = next_layer.experts.quant_method
+            next_layer_kt.gpu_experts_mask_cuda[hot_expert] = True
+            next_layer_kt.gpu_experts_mask_cuda[cold_expert] = False
+
+            next_layer_kt.logical_to_gpu_index_cuda[hot_expert] = cold_gpu_slot
+            next_layer_kt.logical_to_gpu_index_cuda[cold_expert] = -1
+
+            next_layer_kt.gpu_index_to_logical_cuda[cold_gpu_slot] = hot_expert.to(
+                next_layer_kt.gpu_index_to_logical_cuda.dtype
+            )
+        else:
+            return 0
+
+        if next_layer is None:
+            with torch.cuda.stream(self.copy_stream):
+                self.global_buffer.dst_slot_cpu_od[:transfer_num].copy_(cold_gpu_slot, non_blocking=True)
+                self.global_buffer.hot_expert_ids_cpu_od[:transfer_num].copy_(hot_expert, non_blocking=True)
+                self.global_buffer.cold_expert_ids_cpu_od[:transfer_num].copy_(cold_expert, non_blocking=True)
+                for idx in range(transfer_num):
+                    hot_idx = self.global_buffer.hot_expert_ids_cpu_od[idx]
+                    self.global_buffer.w13_weight_ondemand[idx, :self.wrapper.moe_intermediate_size].copy_(
+                        self.wrapper.gate_weights[hot_idx], non_blocking=True
+                    )
+                    self.global_buffer.w13_weight_ondemand[idx, self.wrapper.moe_intermediate_size:].copy_(
+                        self.wrapper.up_weights[hot_idx], non_blocking=True
+                    )
+                    self.global_buffer.w2_weight_ondemand[idx].copy_(
+                        self.wrapper.down_weights[hot_idx], non_blocking=True
+                    )
+                    self.d2h_events[idx].record(self.copy_stream)
+        else:
+            with torch.cuda.stream(self.copy_stream):
+                self.global_buffer.dst_slot_cpu_pre[:transfer_num].copy_(cold_gpu_slot, non_blocking=True)
+                self.global_buffer.hot_expert_ids_cpu_pre[:transfer_num].copy_(hot_expert, non_blocking=True)
+                self.global_buffer.cold_expert_ids_cpu_pre[:transfer_num].copy_(cold_expert, non_blocking=True)
+                for idx in range(transfer_num):
+                    slot = self.global_buffer.dst_slot_cpu_pre[idx]
+                    hot_idx = self.global_buffer.hot_expert_ids_cpu_pre[idx]
+                    next_layer.experts.w13_weight[slot, :self.wrapper.moe_intermediate_size].copy_(
+                        self.wrapper.gate_weights[hot_idx], non_blocking=True
+                    )
+                    next_layer.experts.w13_weight[slot, self.wrapper.moe_intermediate_size:].copy_(
+                        self.wrapper.up_weights[hot_idx], non_blocking=True
+                    )
+                    next_layer.experts.w2_weight[slot].copy_(
+                        self.wrapper.down_weights[hot_idx], non_blocking=True
+                    )
+        return transfer_num
+
+    def extra_expert_submit(self, transfer_num):
+        transfer_num = min(transfer_num, self.num_gpu_experts)
+        if self.global_buffer.extra_event_id % 2 == 0:
+            w13_weight = self.global_buffer.w13_weight_extra
+            w2_weight = self.global_buffer.w2_weight_extra
+        else:
+            w13_weight = self.global_buffer.w13_weight_ondemand
+            w2_weight = self.global_buffer.w2_weight_ondemand
+        with torch.cuda.stream(self.global_buffer.d2h_stream):
+            for idx in range(transfer_num):
+                hot_idx = self.global_buffer.extra_expert_ids_cpu_od[idx + self.global_buffer.extra_event_id * self.num_gpu_experts]
+                w13_weight[idx, :self.wrapper.moe_intermediate_size].copy_(
+                    self.wrapper.gate_weights[hot_idx], non_blocking=True
+                )
+                w13_weight[idx, self.wrapper.moe_intermediate_size:].copy_(
+                    self.wrapper.up_weights[hot_idx], non_blocking=True
+                )
+                w2_weight[idx].copy_(
+                    self.wrapper.down_weights[hot_idx], non_blocking=True
+                )
+            self.global_buffer.extra_events[self.global_buffer.extra_event_id].record(self.global_buffer.d2h_stream)
+        self.global_buffer.extra_event_id += 1
+        return transfer_num
+
+    def extra_expert_comp(self, transfer_num, topk_output, dispatch_output, layer):
+        extra_idx_start = (self.global_buffer.extra_event_id - 1) * self.num_gpu_experts
+        extra_idx_end = extra_idx_start + transfer_num
+
+        with torch.cuda.stream(self.global_buffer.extra_comp_stream):
+            self.global_buffer.extra_comp_stream.wait_event(self.extra_events[self.global_buffer.extra_event_id - 1])
+            self.global_buffer.stage2_reset()
+            self.global_buffer.stage2_gpu_mask_cuda[extra_experts[extra_idx_start:extra_idx_end]] = True
+            self.global_buffer.stage2_logic_to_gpu_index_cuda[extra_experts[extra_idx_start:extra_idx_end]] = self.global_buffer.stage2_extra_gpu_logic_index_cuda
+            extra_masked_topk_ids = mask_and_remap_expert_ids(
+                topk_ids, self.global_buffer.stage2_gpu_mask_cuda, self.global_buffer.stage2_logic_to_gpu_index_cuda
+            )
+            extra_masked_topk_output = topk_output._replace(topk_ids=extra_masked_topk_ids)
+            extra_masked_dispatch_output = dispatch_output._replace(
+                topk_output=extra_masked_topk_output
+            )
+            extra_gpu_combine_input = self.gpu_method.apply(layer, extra_masked_dispatch_output)
+        return extra_gpu_combine_input
+               
+
+    def _layer_scope_scheduler(
+        self,
+        curr_hot_expert,
+        curr_cold_expert,
+        curr_cold_gpu_slot,
+        curr_expert_counts,
+        next_hot_expert,
+        next_cold_expert,
+        next_cold_gpu_slot,
+        next_expert_counts,
+        expert_transferred_num,
+        selected_experts,                  # 当前层：全部专家热度排序（热 -> 冷）
+        lambda_cold: float = 0.5,
+        gamma_next: float = 0.7,
+        enable_opex_fill: bool = True,
+    ):
+        """
+        全局统筹：
+        1) 当前层真正替换到 resident GPU 的 hot experts
+        2) 下一层 prefetch experts
+        3) 额外的 ondemand experts（只返回 expert id，交给全局 buffer 处理）
+
+        score_curr = hot_count - lambda_cold * cold_count
+        score_next = gamma_next * (hot_count - lambda_cold * cold_count)
+
+        注意：
+        - selected_experts 只用于“当前层额外 ondemand fill”
+        - prefetch 部分仍然只看 next_hot_expert / next_cold_expert，不需要全量热度图
+        - extra_ondemand_expert 不配 cold/slot，因为它走你的全局 buffer
+        """
+        budget = int(expert_transferred_num)
+
+        empty_curr_expert = curr_hot_expert.new_empty((0,))
+        empty_curr_slot = curr_cold_gpu_slot.new_empty((0,))
+
+        if next_hot_expert is not None:
+            empty_next_expert = next_hot_expert.new_empty((0,))
+        else:
+            empty_next_expert = curr_hot_expert.new_empty((0,))
+
+        if next_cold_gpu_slot is not None:
+            empty_next_slot = next_cold_gpu_slot.new_empty((0,))
+        else:
+            empty_next_slot = curr_cold_gpu_slot.new_empty((0,))
+
+        # extra ondemand expert ids
+        empty_extra = curr_hot_expert.new_empty((0,))
+
+        if budget <= 0:
+            return (
+                empty_curr_expert,
+                empty_curr_expert,
+                empty_curr_slot,
+                empty_next_expert,
+                empty_next_expert,
+                empty_next_slot,
+                empty_extra,
+            )
+
+        # 基本一致性保护
+        assert curr_hot_expert.numel() == curr_cold_expert.numel() == curr_cold_gpu_slot.numel(), \
+            "curr_hot_expert / curr_cold_expert / curr_cold_gpu_slot length mismatch"
+
+        has_next = (
+            next_hot_expert is not None
+            and next_cold_expert is not None
+            and next_cold_gpu_slot is not None
+            and next_hot_expert.numel() > 0
+        )
+        if has_next:
+            assert next_hot_expert.numel() == next_cold_expert.numel() == next_cold_gpu_slot.numel(), \
+                "next_hot_expert / next_cold_expert / next_cold_gpu_slot length mismatch"
+
+        # --------------------------------------------------
+        # 阶段1：主收益调度（当前层 resident 替换 + 下一层 prefetch）
+        # --------------------------------------------------
+        curr_hot_counts = curr_expert_counts[curr_hot_expert].to(torch.float32)
+        curr_cold_counts = curr_expert_counts[curr_cold_expert].to(torch.float32)
+        curr_score = curr_hot_counts - lambda_cold * curr_cold_counts
+
+        if has_next:
+            next_hot_counts = next_expert_counts[next_hot_expert].to(torch.float32)
+            next_cold_counts = next_expert_counts[next_cold_expert].to(torch.float32)
+            next_score = gamma_next * (next_hot_counts - lambda_cold * next_cold_counts)
+        else:
+            next_hot_expert = empty_next_expert
+            next_cold_expert = empty_next_expert
+            next_cold_gpu_slot = empty_next_slot
+            next_score = curr_score.new_empty((0,))
+
+        all_score = torch.cat([curr_score, next_score], dim=0)
+        valid_idx = torch.nonzero(all_score > 0, as_tuple=True)[0]
+
+        curr_sel = curr_hot_expert.new_empty((0,), dtype=torch.long)
+        next_sel = next_hot_expert.new_empty((0,), dtype=torch.long)
+
+        if valid_idx.numel() > 0:
+            k = min(budget, valid_idx.numel())
+            order = torch.argsort(
+                all_score[valid_idx],
+                descending=True,
+                stable=True,
+            )[:k]
+            chosen = valid_idx[order]
+
+            curr_n = curr_score.numel()
+            curr_sel = chosen[chosen < curr_n]
+            next_sel = chosen[chosen >= curr_n] - curr_n
+
+        selected_curr_hot = curr_hot_expert[curr_sel]
+        selected_curr_cold = curr_cold_expert[curr_sel]
+        selected_curr_slot = curr_cold_gpu_slot[curr_sel]
+
+        selected_next_hot = next_hot_expert[next_sel]
+        selected_next_cold = next_cold_expert[next_sel]
+        selected_next_slot = next_cold_gpu_slot[next_sel]
+
+        used_budget = selected_curr_hot.numel() + selected_next_hot.numel()
+        remaining_budget = budget - used_budget
+
+        # --------------------------------------------------
+        # 阶段2：PCIe 余量填充 -> 只挑“额外 ondemand expert ids”
+        # --------------------------------------------------
+        extra_ondemand_expert = empty_extra
+
+        if (
+            enable_opex_fill
+            and remaining_budget > 0
+            and selected_experts is not None
+            and selected_experts.numel() > 0
+        ):
+            # 1) 保留 selected_experts 原本的“热度顺序”
+            fill_pool = selected_experts
+
+            # 2) 只保留当前确实有流量的专家
+            fill_pool = fill_pool[curr_expert_counts[fill_pool] > 0]
+
+            # 3) 只保留“当前不在 GPU resident 上”的专家
+            fill_pool = fill_pool[self.logical_to_gpu_index_cuda[fill_pool] < 0]
+
+            # 4) 排除已经在阶段1被选中做 resident 替换的 curr_hot experts
+            #    这些已经走真正的 hot replace 路径，不应再进入 extra ondemand buffer
+            if selected_curr_hot.numel() > 0 and fill_pool.numel() > 0:
+                selected_mask = torch.zeros(
+                    curr_expert_counts.numel(),
+                    dtype=torch.bool,
+                    device=curr_hot_expert.device,
+                )
+                selected_mask[curr_hot_expert] = True
+                fill_pool = fill_pool[~selected_mask[fill_pool]]
+
+            # 5) 按 selected_experts 原顺序取前 remaining_budget 个
+            if fill_pool.numel() > 0:
+                extra_ondemand_expert = fill_pool[:remaining_budget]
+            
+        return (
+            selected_curr_hot,
+            selected_curr_cold,
+            selected_curr_slot,
+            selected_next_hot,
+            selected_next_cold,
+            selected_next_slot,
+            extra_ondemand_expert,
+            remaining_budget
+        )
+
+
+    def LayerScopeScheduler(self, dispatch_output, topk_output_next_layer, next_layer):
+        expert_transferred_num = self.global_buffer.get_pcie_transferred_num()
+        device = dispatch_output.topk_output.topk_ids.device
+        # 当前层
+        selected_experts, expert_counts = select_top_experts_from_batch_by_hot(
+            topk_ids=dispatch_output.topk_output.topk_ids,
+            num_experts=self.global_num_experts,
+            num_gpu_experts=self.global_num_experts, # 这里改成global_num_experts，这是为了保证能够充分利用pcie的时间
+        )
+        curr_hot_expert, curr_cold_expert, curr_cold_gpu_slot = self.global_buffer.scheduler(
+            selected_experts[:self.num_gpu_experts],
+            expert_counts,
+            self,
+        )
+
+        # 下一层
+        next_hot_expert = None
+        next_cold_expert = None
+        next_cold_gpu_slot = None
+        expert_counts_next_layer = None
+
+        # if topk_output_next_layer is not None and next_layer is not None:
+        #     selected_experts_next_layer, expert_counts_next_layer = select_top_experts_from_batch_by_hot(
+        #         topk_ids=topk_output_next_layer.topk_ids,
+        #         num_experts=self.global_num_experts,
+        #         num_gpu_experts=self.num_gpu_experts,
+        #     )
+        #     next_layer_kt = next_layer.experts.quant_method
+        #     next_hot_expert, next_cold_expert, next_cold_gpu_slot = self.global_buffer.scheduler(
+        #         selected_experts_next_layer,
+        #         expert_counts_next_layer,
+        #         next_layer_kt,
+        #     )
+
+
+        # 全局统筹
+        (
+            hot_expert,
+            cold_expert,
+            cold_gpu_slot,
+            next_layer_hot_expert,
+            next_layer_cold_expert,
+            next_layer_cold_gpu_slot,
+            extra_ondemand_expert,
+            extra_ondemand_expert_num
+        ) = self._layer_scope_scheduler(
+            curr_hot_expert=curr_hot_expert,
+            curr_cold_expert=curr_cold_expert,
+            curr_cold_gpu_slot=curr_cold_gpu_slot,
+            curr_expert_counts=expert_counts,
+            next_hot_expert=next_hot_expert,
+            next_cold_expert=next_cold_expert,
+            next_cold_gpu_slot=next_cold_gpu_slot,
+            next_expert_counts=expert_counts_next_layer,
+            expert_transferred_num=expert_transferred_num,
+            selected_experts=selected_experts,
+            lambda_cold=0.5,
+            gamma_next=0.7,
+        )
+        if extra_ondemand_expert_num > 0:
+            self.global_buffer.extra_expert_ids_cpu_od[:extra_ondemand_expert_num].copy_(extra_ondemand_expert, non_blocking=True)
+
+        # NOTE: submit expert transfer task 必须要先on-demand。
+        t1 = time.time()
+        ondemand_num = self.submit_bf16_exp_H2D(hot_expert, cold_expert, cold_gpu_slot, None)
+        t2 = time.time()
+        print("*" * 20 + f"Layer: {self.kt_config.layer_idx}" + "*" * 20)
+        print(f"On-Demand expert transfer: submit time={(t2-t1)*1000:.2f}ms")
+        print(f"Current layer: {hot_expert}, {cold_expert}")
+        print(f"Next layer: {next_layer_hot_expert}, {next_layer_cold_expert}")
+        print(f"Extra On-Demand experts: {extra_ondemand_expert}")
+        print("-" * 50)
+
+        # if next_layer_hot_expert != None and next_layer_hot_expert.numel() > 0:
+        #     t1 = time.time()
+        #     prefetch_num = self.submit_bf16_exp_H2D(next_layer_hot_expert, next_layer_cold_expert, next_layer_cold_gpu_slot, next_layer)
+        #     t2 = time.time()
+            
+        #     next_layer_kt.gpu_experts_mask[next_layer_kt.global_buffer.hot_expert_ids_cpu_pre[:prefetch_num]] = True
+        #     next_layer_kt.gpu_experts_mask[next_layer_kt.global_buffer.cold_expert_ids_cpu_pre[:prefetch_num]] = False
+            
+        #     next_layer_kt.logical_to_gpu_index[next_layer_kt.global_buffer.hot_expert_ids_cpu_pre[:prefetch_num]] = next_layer_kt.global_buffer.dst_slot_cpu_pre[:prefetch_num]
+        #     next_layer_kt.logical_to_gpu_index[next_layer_kt.global_buffer.cold_expert_ids_cpu_pre[:prefetch_num]] = -1
+
+        #     next_layer_kt.gpu_index_to_logical[next_layer_kt.global_buffer.dst_slot_cpu_pre[:prefetch_num]] = next_layer_kt.global_buffer.hot_expert_ids_cpu_pre[:prefetch_num]
+        #     t3 = time.time()
+        #     print(f"Next layer prefetch: prefetch_num={prefetch_num}, submit time={(t2-t1)*1000:.2f}ms, complete time={(t3-t2)*1000:.2f}ms")
+        #     print("-" * 50)
+
+        # 这里用于On-Demand的那些专家的计算
+        self.global_buffer.stage2_gpu_mask_cuda[hot_expert] = True
+        self.global_buffer.stage2_logic_to_gpu_index_cuda[hot_expert] = cold_gpu_slot.to(self.global_buffer.stage2_logic_to_gpu_index_cuda.dtype)
+
+        # 这里用于On-Demand的专家CPUmask，保证这些 On-Demand 的专家不会在 CPU 上计算
+        self.wrapper.gpu_experts_mask[self.global_buffer.hot_expert_ids_cpu_od[:ondemand_num]] = True
+        if extra_ondemand_expert_num > 0:
+            self.wrapper.gpu_experts_mask[self.global_buffer.extra_expert_ids_cpu_od[:extra_ondemand_expert_num]] = True
+
+        return (
+            hot_expert,
+            cold_expert,
+            cold_gpu_slot,
+            next_layer_hot_expert,
+            next_layer_cold_expert,
+            next_layer_cold_gpu_slot,
+            extra_ondemand_expert,
+            extra_ondemand_expert_num,
+        )
+
